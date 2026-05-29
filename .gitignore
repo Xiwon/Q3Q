@@ -1,3 +1,6 @@
 .venv
 .vscode
-q35_35b_a3b
+q35_35b_a3b/
+
+__pycache__
+out
