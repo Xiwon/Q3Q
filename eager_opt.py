@@ -138,19 +138,6 @@ def apply_rotary_pos_emb(
     k_out = torch.cat([(k_rot * cos) + (rotate_half(k_rot) * sin), k_pass], dim=-1)
     return q_out, k_out
 
-def _apply_rotary_pos_emb(
-    q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    # this function is a tmp function to 
-    #   fix the issue when the cache is not fully applied on both linear & full attention
-    rotary_dim = cos.shape[-1]
-    q_rot, q_pass = q[..., :rotary_dim], q[..., rotary_dim:]
-    k_rot, k_pass = k[..., :rotary_dim], k[..., rotary_dim:]
-    q_out = torch.cat([(q_rot * cos[:, :, -1:, :]) + (rotate_half(q_rot) * sin[:, :, -1:, :]), q_pass], dim=-1)
-    k_out = torch.cat([(k_rot * cos[:, :, -1:, :]) + (rotate_half(k_rot) * sin[:, :, -1:, :]), k_pass], dim=-1)
-    # take the last vector of cos & sin and calc RoPE
-    return q_out, k_out
-
 def _l2norm(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
     return x * torch.rsqrt((x * x).sum(dim=-1, keepdim=True) + eps)
 
@@ -209,9 +196,6 @@ class GatedDeltaNet(nn.Module):
         self.norm = RMSNormGated(self.v_head_dim, config.rms_norm_eps)
 
     def prefill(self, hidden_states: torch.Tensor, cache: Cache) -> torch.Tensor:
-        # cache.append(CacheGatedDeltaNet()) # to be continued
-        # return self.forward(hidden_states, -1, cache)
-
         B, T, _ = hidden_states.shape
         orig_dtype = hidden_states.dtype
 
@@ -291,90 +275,14 @@ class GatedDeltaNet(nn.Module):
         out = out.reshape(B, T, self.v_dim)
         return self.out_proj(out)
 
-    def _origin(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        B, T, _ = hidden_states.shape
-        orig_dtype = hidden_states.dtype
-
-        # in `mixed` tensor, every token's vector contain 3 parts representing qkv
-        mixed = self.in_proj_qkv(hidden_states)              # -> (B, T, qkv_dim)
-        mixed = mixed.transpose(1, 2)                        # -> (B, qkv_dim, T)
-        mixed = F.pad(mixed, (self.conv_kernel_size - 1, 0)) # pad conv_kernel_size-1 zeros left, 0 zeros right
-        mixed = self.conv1d(mixed)                           # every dimension as a channel
-        mixed = F.silu(mixed)
-        mixed = mixed.transpose(1, 2)                        # -> (B, T, qkv_dim)
-
-        q, k, v = mixed.split([self.qk_dim, self.qk_dim, self.v_dim], dim=-1)
-        q = q.view(B, T, self.num_k_heads, self.k_head_dim)
-        k = k.view(B, T, self.num_k_heads, self.k_head_dim)
-        v = v.view(B, T, self.num_v_heads, self.v_head_dim)
-
-        if self.num_v_heads > self.num_k_heads:
-            rep = self.num_v_heads // self.num_k_heads
-            q = q.repeat_interleave(rep, dim=2)
-            k = k.repeat_interleave(rep, dim=2)
-            # !note: q, k -> (B, T, num_v_heads, k_head_dim) from now on
-
-        # z is the per-head output gate -> (B, T, num_v_heads, v_head_dim).
-        z = self.in_proj_z(hidden_states).reshape(B, T, self.num_v_heads, self.v_head_dim)
-
-        b = self.in_proj_b(hidden_states)   # -> (B, T, num_v_heads)
-        a = self.in_proj_a(hidden_states)   # -> (B, T, num_v_heads)
-        beta = b.sigmoid()
-        g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias.float())
-
-        q = _l2norm(q.float(), eps=1e-6)
-        k = _l2norm(k.float(), eps=1e-6)
-        v = v.float()
-        beta = beta.float()
-        scale = 1.0 / math.sqrt(self.k_head_dim)
-        q = q * scale
-
-        # recurrent delta-rule (eager)
-        # state -> (B, num_v_heads, k_head_dim, v_head_dim).
-        state = torch.zeros(
-            B, self.num_v_heads, self.k_head_dim, self.v_head_dim,
-            dtype=torch.float32, device=hidden_states.device,
-        )
-        out = torch.empty(
-            B, T, self.num_v_heads, self.v_head_dim,
-            dtype=torch.float32, device=hidden_states.device,
-        )
-
-        for t in range(T):
-            q_t = q[:, t] # (B, num_v_heads, k_head_dim) !note: qk was expanded before
-            k_t = k[:, t] # (B, num_v_heads, k_head_dim)
-            v_t = v[:, t] # (B, num_v_heads, v_head_dim)
-            
-            # last_recurrent_state *= exp(g_t)
-            g_t = g[:, t].exp()[:, :, None, None] # (B, num_v_heads, 1, 1)
-            state = state * g_t
-
-            # delta = (v - state^T k) * beta. !note: here we use *key* for read
-            beta_t = beta[:, t].unsqueeze(-1) # (B, num_v_heads, 1)
-            kv_mem = (state * k_t.unsqueeze(-1)).sum(dim=-2) # (B, nv, v_head_dim)
-            delta = (v_t - kv_mem) * beta_t                  # (B, nv, v_head_dim)
-            # state += k * delta
-            state = state + k_t.unsqueeze(-1) * delta.unsqueeze(-2)
-            # output = sum_d state[..., d, :] * q[..., d]
-            out[:, t] = (state * q_t.unsqueeze(-1)).sum(dim=-2)
-
-        out = out.to(orig_dtype) # (B, T, num_v_heads, v_head_dim)
-        # norm over v_head_dim, then silu-gate by z
-        out = self.norm(out, z.to(orig_dtype))
-        out = out.reshape(B, T, self.v_dim)
-        return self.out_proj(out)
-
     def forward(self, hidden_states: torch.Tensor, layer_idx: int, cache: Cache) -> torch.Tensor:
-        h = hidden_states[:, -1:, :]
-
+        h = hidden_states
         B, T, _ = h.shape
         orig_dtype = h.dtype
 
         # in `mixed` tensor, every token's vector contain 3 parts representing qkv
-        mixed = self.in_proj_qkv(h)              # -> (B, T, qkv_dim)
-        mixed = mixed.transpose(1, 2)                        # -> (B, qkv_dim, T)
-        # mixed = F.pad(mixed, (self.conv_kernel_size - 1, 0)) # pad conv_kernel_size-1 zeros left, 0 zeros right
-        # mixed = self.conv1d(mixed)                           # every dimension as a channel
+        mixed = self.in_proj_qkv(h)     # -> (B, T, qkv_dim)
+        mixed = mixed.transpose(1, 2)   # -> (B, qkv_dim, T)
         
         mixed, state = cache.update(layer_idx, mixed_t=mixed)
         # update current vector & get current conv1d values and last state cache
@@ -412,17 +320,6 @@ class GatedDeltaNet(nn.Module):
         scale = 1.0 / math.sqrt(self.k_head_dim)
         q = q * scale
 
-        # recurrent delta-rule (eager)
-        # state -> (B, num_v_heads, k_head_dim, v_head_dim).
-        # state = torch.zeros(
-        #     B, self.num_v_heads, self.k_head_dim, self.v_head_dim,
-        #     dtype=torch.float32, device=h.device,
-        # ) # no need to calc state again
-        # out = torch.empty(
-        #     B, T, self.num_v_heads, self.v_head_dim,
-        #     dtype=torch.float32, device=h.device,
-        # )
-
         q_t = q.squeeze(1) # (B, num_v_heads, k_head_dim) !note: qk was expanded before
         k_t = k.squeeze(1) # (B, num_v_heads, k_head_dim)
         v_t = v.squeeze(1) # (B, num_v_heads, v_head_dim)
@@ -437,39 +334,14 @@ class GatedDeltaNet(nn.Module):
         delta = (v_t - kv_mem) * beta_t                  # (B, nv, v_head_dim)
         # state += k * delta
         state = state + k_t.unsqueeze(-1) * delta.unsqueeze(-2)
-        # output = sum_d state[..., d, :] * q[..., d]
-        # out[:, t] = (state * q_t.unsqueeze(-1)).sum(dim=-2)
-
         cache.update(layer_idx, state_t=state)
 
         out = (state * q_t.unsqueeze(-1)).sum(dim=-2)
-
-        # for t in range(T):
-        #     q_t = q[:, t] # (B, num_v_heads, k_head_dim) !note: qk was expanded before
-        #     k_t = k[:, t] # (B, num_v_heads, k_head_dim)
-        #     v_t = v[:, t] # (B, num_v_heads, v_head_dim)
-            
-        #     # last_recurrent_state *= exp(g_t)
-        #     g_t = g[:, t].exp()[:, :, None, None] # (B, num_v_heads, 1, 1)
-        #     state = state * g_t
-
-        #     # delta = (v - state^T k) * beta. !note: here we use *key* for read
-        #     beta_t = beta[:, t].unsqueeze(-1) # (B, num_v_heads, 1)
-        #     kv_mem = (state * k_t.unsqueeze(-1)).sum(dim=-2) # (B, nv, v_head_dim)
-        #     delta = (v_t - kv_mem) * beta_t                  # (B, nv, v_head_dim)
-        #     # state += k * delta
-        #     state = state + k_t.unsqueeze(-1) * delta.unsqueeze(-2)
-        #     # output = sum_d state[..., d, :] * q[..., d]
-        #     out[:, t] = (state * q_t.unsqueeze(-1)).sum(dim=-2)
-
         out = out.to(orig_dtype) # (B, T, num_v_heads, v_head_dim)
         # norm over v_head_dim, then silu-gate by z
         out = self.norm(out, z.to(orig_dtype))
         out = out.reshape(B, T, self.v_dim)
         out = self.out_proj(out)
-
-        origin_out = self._origin(hidden_states)
-        out = torch.cat([origin_out[:, :-1, :], out], dim=1)
         return out
 
 class FullAttention(nn.Module):
@@ -543,46 +415,6 @@ class FullAttention(nn.Module):
         out = out * torch.sigmoid(gate)
         return self.o_proj(out)
 
-    def _origin(
-        self,
-        hidden_states: torch.Tensor,
-        cos: torch.Tensor,
-        sin: torch.Tensor,
-        attention_mask: torch.Tensor,
-    ) -> torch.Tensor:
-        B, T, _ = hidden_states.shape
-
-        # q_proj packs Q and gate INSIDE each head: shape (B, T, num_heads, 2*head_dim).
-        qg = self.q_proj(hidden_states).view(B, T, self.num_heads, 2 * self.head_dim)
-        q, gate = qg.chunk(2, dim=-1) # each (B, T, num_heads, head_dim)
-        gate = gate.reshape(B, T, self.num_heads * self.head_dim)
-        k = self.k_proj(hidden_states).view(B, T, self.num_kv_heads, self.head_dim)
-        v = self.v_proj(hidden_states).view(B, T, self.num_kv_heads, self.head_dim)
-
-        q = self.q_norm(q)
-        k = self.k_norm(k)
-
-        q = q.transpose(1, 2) # (B, num_heads, T, head_dim)
-        k = k.transpose(1, 2)
-        v = v.transpose(1, 2)
-
-        q, k = apply_rotary_pos_emb(q, k, cos, sin)
-
-        # assume num_q_heads is a multiple of num_kv_heads
-        if self.num_kv_heads < self.num_heads:
-            rep = self.num_heads // self.num_kv_heads
-            k = k.repeat_interleave(rep, dim=1)
-            v = v.repeat_interleave(rep, dim=1)
-
-        attn = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.head_dim)
-        attn = attn + attention_mask
-
-        attn = F.softmax(attn.float(), dim=-1).to(q.dtype)
-        out = torch.matmul(attn, v)
-        out = out.transpose(1, 2).contiguous().view(B, T, self.num_heads * self.head_dim)
-        out = out * torch.sigmoid(gate)
-        return self.o_proj(out)
-
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -592,9 +424,7 @@ class FullAttention(nn.Module):
         sin: torch.Tensor,
         attention_mask: Optional[torch.Tensor],
     ) -> torch.Tensor:
-        h = hidden_states[:, -1:, :]
-        # here we will use only the last vector operation 
-        #   to verify the correctness of the cache.
+        h = hidden_states
         B, T, _ = h.shape
 
         # q_proj packs Q and gate INSIDE each head: shape (B, T, num_heads, 2*head_dim).
@@ -611,7 +441,7 @@ class FullAttention(nn.Module):
         k = k.transpose(1, 2) # for decode step, always assume T == 1
         v = v.transpose(1, 2)
 
-        q, k = _apply_rotary_pos_emb(q, k, cos, sin)
+        q, k = apply_rotary_pos_emb(q, k, cos, sin)
 
         k, v = cache.update(layer_idx, key_t=k, value_t=v)
         # use kv cache
@@ -627,9 +457,6 @@ class FullAttention(nn.Module):
         attn = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.head_dim)
         # (B, num_heads, 1, T)
 
-        # if attention_mask is not None:
-        #     attn = attn + attention_mask
-
         attn = F.softmax(attn.float(), dim=-1).to(q.dtype)
         out = torch.matmul(attn, v)
         # (B, num_heads, 1, head_dim)
@@ -637,11 +464,6 @@ class FullAttention(nn.Module):
         out = out.transpose(1, 2).contiguous().view(B, T, self.num_heads * self.head_dim)
         out = out * torch.sigmoid(gate)
         out = self.o_proj(out)
-
-        origin_out = self._origin(hidden_states, cos, sin, attention_mask)
-
-        origin_out = origin_out[:, :-1, :] # replace the last token as ours
-        out = torch.cat([origin_out, out], dim=1)
         return out
 
 class QMoeMLP(nn.Module):
@@ -837,11 +659,12 @@ class QMoeModel(nn.Module):
     def forward(
         self,
         input_ids: torch.Tensor,
-        cache: Cache
+        cache: Cache,
+        token_pos: int,
     ) -> torch.Tensor:
         B, T = input_ids.shape
         h = self.embed_tokens(input_ids) # h -> (B, T, hidden_size)
-        position_ids = torch.arange(T, device=input_ids.device).unsqueeze(0).expand(B, -1)
+        position_ids = torch.tensor([token_pos], device=input_ids.device).unsqueeze(0).expand(B, -1)
         # position_ids -> (B, T): 0, 1, ... T-1  repeat for B times
         cos, sin = self.rotary_emb(h, position_ids)
         cos = cos.unsqueeze(1)
@@ -866,26 +689,22 @@ class QMoeEngine(nn.Module):
 
     @torch.no_grad()
     def prefill(self, input_ids: torch.Tensor):
-        """Process the full prompt. Returns (logits, state)"""
+        """Process the full prompt. Returns logits"""
 
         # h = self.model(input_ids, cache)
         h, cache = self.model.prefill(input_ids)
         # print(f"[QMoeEngine.prefill]> cache.size() = {cache.size()}")
         # print(f"[QMoeEngine.prefill]> h.shape = {h.shape}")
         logits = self.lm_head(h)
-        state = {"history_ids": input_ids.detach().clone()}
-        return logits, state, cache
+        return logits, cache
 
     @torch.no_grad()
-    def decode_step(self, next_token: torch.Tensor, state: dict, cache: Cache):
-        """Run a single decoding step. Returns (logits_for_new_token, new_state)"""
+    def decode_step(self, next_token: torch.Tensor, cache: Cache, token_pos: int):
+        """Run a single decoding step. Returns logits_for_new_token"""
         
-        history = state["history_ids"]
-        full_ids = torch.cat([history, next_token], dim=-1)
-        h = self.model(full_ids, cache)
-        logits = self.lm_head(h[:, -1:, :])
-        state["history_ids"] = full_ids
-        return logits, state
+        h = self.model(next_token, cache, token_pos)
+        logits = self.lm_head(h)
+        return logits
 
     @staticmethod
     def _sample(logits: torch.Tensor, temperature: float, top_p: float) -> torch.Tensor:
@@ -911,13 +730,14 @@ class QMoeEngine(nn.Module):
     ) -> torch.Tensor:
         eos_set = set(eos_token_ids or [])
         result = input_ids
-        logits, state, cache = self.prefill(input_ids)
-        for _ in range(max_new_tokens):
+        logits, cache = self.prefill(input_ids)
+        prefill_token_num = input_ids.shape[1]
+        for i in range(max_new_tokens):
             next_tok = self._sample(logits[:, -1, :], temperature, top_p)
             result = torch.cat([result, next_tok], dim=-1)
             if eos_set and next_tok.item() in eos_set:
                 break
-            logits, state = self.decode_step(next_tok, state, cache)
+            logits = self.decode_step(next_tok, cache, prefill_token_num + i)
         return result
 
 CHECKPOINT_PREFIX = "model.language_model."
