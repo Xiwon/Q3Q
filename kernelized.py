@@ -112,13 +112,15 @@ class RMSNormGated(nn.Module):
         self.eps = eps
 
     def forward(self, x: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
-        orig_dtype = x.dtype
-        x_f = x.float()
-        var = x_f.pow(2).mean(-1, keepdim=True)
-        x_f = x_f * torch.rsqrt(var + self.eps)
-        out = (self.weight * x_f).to(orig_dtype)
-        out = out * F.silu(gate.float()).to(orig_dtype)
-        return out
+        # orig_dtype = x.dtype
+        # x_f = x.float()
+        # var = x_f.pow(2).mean(-1, keepdim=True)
+        # x_f = x_f * torch.rsqrt(var + self.eps)
+        # out = (self.weight * x_f).to(orig_dtype)
+        # out = out * F.silu(gate.float()).to(orig_dtype)
+        # return out
+        import kernels.rms_norm_gated
+        return kernels.rms_norm_gated.forward(x, self.weight, self.eps, gate)
 
 def rotate_half(x: torch.Tensor) -> torch.Tensor:
     x1 = x[..., : x.shape[-1] // 2]
